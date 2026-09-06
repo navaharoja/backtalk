@@ -103,7 +103,15 @@ _AUTOAPPROVE = {"on": False}
 # always gets you heard. gen bumps on every switch so an in-flight
 # open-mic capture from before the switch gets discarded, never
 # processed.
-_MIC = {"mode": "ptt", "gen": 0, "btn": False}
+#
+# "toggle" is a third shape layered on top: the talk key is a LATCH,
+# not a hold. Tap it once and the mic listens hands-free (same VAD path
+# as "open"); tap it again and the mic closes. `toggle` is armed from
+# the config key mic_mode == "toggle"; `latched` is the live on/off the
+# tap flips. While latched the loop runs the open-mic branch; while not,
+# the mic is fully closed like ptt at rest.
+_MIC = {"mode": "ptt", "gen": 0, "btn": False,
+        "toggle": False, "latched": False}
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -652,6 +660,11 @@ async def amain():
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
     _MIC["mode"] = "open" if (open_mic
                               or CFG.get("mic_mode") == "open") else "ptt"
+    # Tap-to-latch: the key toggles hands-free listening on and off
+    # instead of being held. Sits on top of "ptt" as the resting mode
+    # (mic closed until the first tap).
+    _MIC["toggle"] = (not open_mic) and CFG.get("mic_mode") == "toggle"
+    _MIC["latched"] = False
     # resume_last_session: reattach to the saved conversation, if any
     resume_id = None
     if CFG.get("resume_last_session"):
@@ -670,6 +683,8 @@ async def amain():
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
+            else f"tap-to-listen ({CFG['ptt_key']} latches the mic on/off)"
+            if _MIC["toggle"]
             else f"push-to-talk ({CFG['ptt_key']})")
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"model={brain.model} mic={mode} "
@@ -968,7 +983,7 @@ async def amain():
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
             waiters = {press_fut, typed_fut}
-            if _MIC["mode"] == "open":
+            if _MIC["mode"] == "open" or (_MIC["toggle"] and _MIC["latched"]):
                 if mic_fut is None:
                     g = _MIC["gen"]
                     mic_fut = loop.run_in_executor(
@@ -1008,6 +1023,34 @@ async def amain():
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
+                if _MIC["toggle"]:
+                    # TAP-TO-LISTEN: the key is a latch, not a hold.
+                    perm_wait = (_PERM["fut"] is not None
+                                 and not _PERM["fut"].done())
+                    if perm_wait:
+                        # mid permission-ask: a tap only makes sure the
+                        # mic is open to hear the answer, never closes it.
+                        if not _MIC["latched"]:
+                            _MIC["latched"] = True
+                            signals.set_state("listening")
+                            print("[ptt] mic ON (answering)", flush=True)
+                        continue
+                    if _MIC["latched"]:
+                        _MIC["latched"] = False
+                        _MIC["gen"] += 1     # abort any in-flight capture
+                        if speak_task and not speak_task.done():
+                            speak_task.cancel()   # a tap also stops her talking
+                        mouth.shut_up()
+                        signals.static_stop()
+                        signals.set_state("idle")
+                        print("[ptt] mic OFF (tap to listen again)", flush=True)
+                        log("[ptt] toggle -> off")
+                    else:
+                        _MIC["latched"] = True
+                        signals.set_state("listening")
+                        print("[ptt] mic ON (tap again to stop)", flush=True)
+                        log("[ptt] toggle -> on")
+                    continue
                 press_t = time.monotonic()
                 perm_wait = (_PERM["fut"] is not None
                              and not _PERM["fut"].done())

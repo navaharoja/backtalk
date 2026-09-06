@@ -97,6 +97,11 @@ DEFAULTS = {
     # room CAN trigger it, and with open speakers it can hear itself
     # (headphones recommended). The key still works in hands-free
     # listening: it interrupts, and holding it always gets you heard.
+    # "toggle" (tap to listen): the key is a LATCH — tap it once and the
+    # mic listens hands-free, tap again and it closes. Best of both: no
+    # key to hold, but the mic is only open when you chose to open it.
+    # Tapping while the agent is talking also stops her. Pair it with a
+    # headset button by setting ptt_key to "headset" (media play/pause).
     # Switch live by voice: "go hands free" / "push to talk mode"
     # (the switch saves itself here). The --open-mic launch flag
     # forces "open" for one session.

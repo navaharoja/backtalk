@@ -64,6 +64,12 @@ def resolve_key(name: str):
         "right_ctrl": "ctrl_r", "left_ctrl": "ctrl_l",
         "right_cmd": "cmd_r", "left_cmd": "cmd_l",
         "right_shift": "shift_r", "left_shift": "shift_l",
+        # Headset / inline-remote buttons. Most wired and some Bluetooth
+        # headsets send the media play/pause key from their single
+        # button; Windows and macOS may or may not route it through the
+        # global key hook, so this is worth trying but not guaranteed.
+        "headset": "media_play_pause", "headset_button": "media_play_pause",
+        "play_pause": "media_play_pause", "media": "media_play_pause",
     }
     name = aliases.get(name, name)
     try:
