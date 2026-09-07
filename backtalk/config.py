@@ -74,6 +74,17 @@ DEFAULTS = {
     # behaves as "ask" (a headless voice session could never render
     # the terminal prompt it promised).
     "permission_mode": "ask",
+    # In "ask" mode, tools named here skip the spoken permission prompt.
+    # The point is latency: in a voice session every gated call plays an
+    # ask and waits for the hear-tap-say-yes loop (20+ seconds each), and
+    # a turn that reads three files stacks three of them. These are all
+    # read-only, so auto-approving them costs nothing. The SDK approves
+    # anything in this list BEFORE the spoken gate is consulted, so
+    # everything that CHANGES something still asks: file writes, Bash,
+    # git, and WebFetch (a fetched page is outside content — it stays
+    # gated on purpose). Set to [] to make every tool ask again.
+    "unprompted_read_tools": ["Read", "Grep", "Glob", "LS", "WebSearch",
+                              "NotebookRead", "TodoWrite"],
     # Which of your agent's skills the voice session can SEE. null keeps the
     # CLI's own default (all of them). [] hides every one. A list names the
     # ones to allow.
@@ -160,6 +171,22 @@ DEFAULTS = {
     #
     # NOT "stt_device" below, which is the Whisper COMPUTE device.
     "mic_device": "",
+    # Open-mic voice detection. Applies ONLY to hands-free ("open") and
+    # tap-to-listen ("toggle") — push-to-talk uses the button as its
+    # detector and ignores all three.
+    #   vad_aggressiveness  webrtcvad 0-3; 3 rejects the most non-speech.
+    #                       Raise if room noise keeps opening utterances
+    #                       (Whisper then fills them with caption filler
+    #                       like "thanks for watching"); lower if it
+    #                       clips the start of quiet speech.
+    #   vad_silence_ms      trailing quiet that ends an utterance.
+    #   vad_min_speech_ms   an utterance with less real speech than this
+    #                       is treated as a noise blip and dropped before
+    #                       transcription. Kept low so a quick "yes" to a
+    #                       spoken permission ask still registers.
+    "vad_aggressiveness": 3,
+    "vad_silence_ms": 480,
+    "vad_min_speech_ms": 360,
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

@@ -83,10 +83,19 @@ class WarmBrain:
         # backtalk's "ask" = the SDK's "default" mode with gated calls
         # routed to the spoken can_use_tool gate.
         sdk_mode = "default" if mode == "ask" else mode
-        if sdk_mode == "bypassPermissions" and self._can_use_tool \
-                and CanUseToolShadowedWarning:
-            # Deliberate auto-approve: the SDK warns that the callback is
-            # shadowed. That IS the chosen behavior, so boot quietly.
+        # Read-only tools that skip the spoken permission ask (config:
+        # unprompted_read_tools). The SDK auto-approves anything in
+        # allowed_tools BEFORE can_use_tool runs, so writes, Bash, git
+        # and WebFetch still hit the spoken gate. Empty in "ask" only if
+        # the user cleared the list; irrelevant under bypassPermissions.
+        allow = list(CFG.get("unprompted_read_tools") or []) \
+            if mode == "ask" else []
+        if CanUseToolShadowedWarning and self._can_use_tool and (
+                sdk_mode == "bypassPermissions" or allow):
+            # The SDK warns that the callback is shadowed for the
+            # auto-approved tools. That IS the chosen behavior (a
+            # deliberate auto-approve, or this curated read-only
+            # allowlist), so boot quietly.
             warnings.filterwarnings("ignore",
                                     category=CanUseToolShadowedWarning)
         resume, self._resume_id = self._resume_id, None   # consume once
@@ -100,6 +109,7 @@ class WarmBrain:
                 include_partial_messages=True,
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
+                allowed_tools=allow,
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,

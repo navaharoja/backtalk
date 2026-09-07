@@ -45,6 +45,30 @@ MAX_UTTER_S = 30
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 
+# Whisper was trained on video captions, so on silence or non-speech noise
+# it emits a stock caption phrase instead of nothing -- "thank you",
+# "thanks for watching", a lone "you", a row of dots. Push-to-talk barely
+# sees these (the button brackets real speech); an open or latched mic
+# fires them as ghost turns that interrupt whatever is actually being
+# said. Dropped only when the phrase is the WHOLE transcript, so a real
+# sentence that contains "thank you" is left alone.
+_HALLUCINATION = {
+    "you", "thank you", "thank you very much", "thanks for watching",
+    "thank you for watching", "thanks for watching everyone",
+    "please subscribe", "like and subscribe", "don't forget to subscribe",
+    "see you next time", "see you in the next video", "see you",
+    "subtitles by the amara.org community",
+    "transcription by castingwords",
+}
+
+
+def _looks_hallucinated(text: str) -> bool:
+    """True when the whole transcript is Whisper's non-speech filler."""
+    raw = text.strip()
+    if not raw or set(raw) <= {".", " ", "…", "-", ","}:
+        return True
+    return raw.lower().strip(" .!?,-…") in _HALLUCINATION
+
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
@@ -338,13 +362,31 @@ def transcribe(pcm: np.ndarray) -> str:
     else:
         segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
         text = "".join(s.text for s in segments).strip()
-    return _NONSPEECH.sub("", text).strip()
+    cleaned = _NONSPEECH.sub("", text).strip()
+    return "" if _looks_hallucinated(cleaned) else cleaned
 
 
 class Ears:
-    def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
+    def __init__(self, aggressiveness: int | None = None,
+                 silence_ms: int | None = None,
+                 min_speech_ms: int | None = None):
+        # These only bite the open / tap-to-listen mic. Push-to-talk uses
+        # the button as its detector (record_held) and never calls here.
+        # aggressiveness: webrtcvad 0-3, higher rejects more non-speech;
+        # bumped from 2 to 3 as the default after an open mic kept
+        # opening utterances on room noise for Whisper to fill with
+        # caption filler. min_speech_ms: an utterance carrying less real
+        # speech than this is a noise blip, dropped unheard -- kept short
+        # so a quick "yes" to a permission ask still counts.
+        if aggressiveness is None:
+            aggressiveness = int(CFG.get("vad_aggressiveness", 3))
+        if silence_ms is None:
+            silence_ms = int(CFG.get("vad_silence_ms", 480))
+        if min_speech_ms is None:
+            min_speech_ms = int(CFG.get("vad_min_speech_ms", 360))
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
+        self.min_speech_frames = max(1, min_speech_ms // FRAME_MS)
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
                     abort=None) -> str | None:
@@ -393,8 +435,8 @@ class Ears:
                         silence_run += 1
                     if silence_run >= self.silence_frames or \
                        len(frames) * FRAME_MS / 1000 > MAX_UTTER_S:
-                        if speech_total < 8:
-                            # <240ms of actual speech: a noise blip, not
+                        if speech_total < self.min_speech_frames:
+                            # too little actual speech: a noise blip, not
                             # a sentence — keep listening
                             in_utterance = False
                             frames, ring = [], []
