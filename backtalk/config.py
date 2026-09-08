@@ -100,6 +100,15 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # A SECOND talk key that is ALWAYS push-to-talk hold, no matter what
+    # mic_mode is. Hold it -> mic opens; release -> the utterance is sent;
+    # it never touches the latch or the hands-free state. The point: a
+    # "toggle" or "open" setup keyed to a headset button can still have a
+    # plain hold-to-talk key on the keyboard for when the headset is off
+    # (no button to tap) and an open mic on the speakers would hear the
+    # reply. "" disables it. Same key names as ptt_key; ignored when it
+    # equals ptt_key.
+    "hold_key": "",
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.

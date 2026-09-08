@@ -681,11 +681,15 @@ async def amain():
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
 
+    _hk_boot = str(CFG.get("hold_key") or "").strip()
+    _hk_note = (f"; hold {_hk_boot} to talk"
+                if _hk_boot and _hk_boot.lower() != str(CFG["ptt_key"]).strip().lower()
+                else "")
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
             else f"tap-to-listen ({CFG['ptt_key']} latches the mic on/off)"
             if _MIC["toggle"]
-            else f"push-to-talk ({CFG['ptt_key']})")
+            else f"push-to-talk ({CFG['ptt_key']})") + _hk_note
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"model={brain.model} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
@@ -951,6 +955,48 @@ async def amain():
         speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
         return True
 
+    async def hold_and_record(listener) -> bool:
+        """Push-to-talk on a HELD key: mic open while held, the utterance
+        sent on release, the latch/hands-free state left untouched. Shared
+        by ptt_key in its non-latch modes and by the always-on hold_key.
+        Returns False only when the utterance is a quit phrase."""
+        press_t = time.monotonic()
+        perm_wait = (_PERM["fut"] is not None and not _PERM["fut"].done())
+        if speak_task and not speak_task.done() and not perm_wait:
+            log("[turn] interrupted mid-reply — key pressed")
+            speak_task.cancel()          # the button = interrupt
+        # During a permission ask the TURN stays alive; the press only
+        # silences playback and records the answer.
+        mouth.shut_up()
+        signals.static_stop()            # button kills the static too
+        signals.set_state("listening")
+        mouth.ducker.speech_start()      # duck NOW, while you talk
+        print("[ptt] recording (release to send)...", flush=True)
+        _MIC["btn"] = True               # open mic yields to the button
+        try:
+            text = await loop.run_in_executor(
+                None, lambda: record_held(listener.is_held))
+        except Exception as e:
+            # A device-level failure gets plain words instead of a raw
+            # exception (a mic unplugged mid-session is the case the old
+            # message handled worst: jargon, on every press).
+            if explain_audio_failure(e):
+                mouth.say("I can't hear you. There's no working "
+                          "microphone I can use.")
+            else:
+                log(f"[ears] record/transcribe failed: {e!r}")
+                mouth.say("My ears hit an error. Check this "
+                          "window for the details.")
+            text = None
+        finally:
+            _MIC["btn"] = False
+        mouth.ducker.speech_end(0.2)     # snap back fast on release
+        if not text:
+            log("[ptt] (tap or empty — ignored)")
+            signals.set_state("idle")
+            return True
+        return await handle(text, spoke_from=press_t)
+
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key
         # is constructed and honored in BOTH modes: in hands-free
@@ -960,7 +1006,16 @@ async def amain():
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
         ptt = PTTListener(CFG["ptt_key"])
+        # Optional second key: ALWAYS hold-to-talk, whatever mic_mode is.
+        # Lets a headset-button latch setup keep a plain keyboard talk key
+        # for when the headset is off.
+        _hk = str(CFG.get("hold_key") or "").strip()
+        ptt_hold = (PTTListener(_hk) if _hk and _hk.lower()
+                    != str(CFG["ptt_key"]).strip().lower() else None)
+        if ptt_hold is not None:
+            log(f"[backtalk] hold-to-talk key: {_hk}")
         press_fut: asyncio.Future | None = None
+        press2_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]
         # The open mic yields while the BUTTON records (or the double
@@ -976,13 +1031,19 @@ async def amain():
                 # a stale press or capture can't fire after a switch
                 if press_fut is not None and press_fut.done():
                     press_fut.result(); press_fut = None
+                if press2_fut is not None and press2_fut.done():
+                    press2_fut.result(); press2_fut = None
                 if mic_fut is not None and mic_fut.done():
                     mic_fut.result(); mic_fut = None
             if typed_fut is None:
                 typed_fut = loop.run_in_executor(None, typed_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
+            if ptt_hold is not None and press2_fut is None:
+                press2_fut = loop.run_in_executor(None, ptt_hold.wait_press)
             waiters = {press_fut, typed_fut}
+            if press2_fut is not None:
+                waiters.add(press2_fut)
             if _MIC["mode"] == "open" or (_MIC["toggle"] and _MIC["latched"]):
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -1021,6 +1082,11 @@ async def amain():
                 if text and not await handle(text):
                     return
                 continue
+            if press2_fut is not None and press2_fut in done:
+                press2_fut.result(); press2_fut = None
+                if not await hold_and_record(ptt_hold):
+                    return
+                continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
                 if _MIC["toggle"]:
@@ -1051,47 +1117,9 @@ async def amain():
                         print("[ptt] mic ON (tap again to stop)", flush=True)
                         log("[ptt] toggle -> on")
                     continue
-                press_t = time.monotonic()
-                perm_wait = (_PERM["fut"] is not None
-                             and not _PERM["fut"].done())
-                if speak_task and not speak_task.done() and not perm_wait:
-                    log("[turn] interrupted mid-reply — key pressed")
-                    speak_task.cancel()          # the button = interrupt
-                # During a permission ask the TURN stays alive; the
-                # press only silences playback and records the answer.
-                mouth.shut_up()
-                signals.static_stop()            # button kills the static too
-                signals.set_state("listening")
-                mouth.ducker.speech_start()      # duck NOW, while you talk
-                print("[ptt] recording (release to send)...", flush=True)
-                _MIC["btn"] = True               # open mic yields to the button
-                try:
-                    text = await loop.run_in_executor(
-                        None, lambda: record_held(ptt.is_held))
-                except Exception as e:
-                    # A device-level failure gets plain words instead of a
-                    # raw exception. The pre-flight at startup cannot catch
-                    # a microphone unplugged mid-session, and that is the
-                    # case where the old message was worst: jargon, on
-                    # every press, with the key hook still working so it
-                    # looked like it was listening.
-                    if explain_audio_failure(e):
-                        mouth.say("I can't hear you. There's no working "
-                                  "microphone I can use.")
-                    else:
-                        log(f"[ears] record/transcribe failed: {e!r}")
-                        mouth.say("My ears hit an error. Check this "
-                                  "window for the details.")
-                    text = None
-                finally:
-                    _MIC["btn"] = False
-                mouth.ducker.speech_end(0.2)     # snap back fast on release
-                if not text:
-                    log("[ptt] (tap or empty — ignored)")
-                    signals.set_state("idle")
-                    continue
-                if not await handle(text, spoke_from=press_t):
+                if not await hold_and_record(ptt):
                     return
+                continue
     except KeyboardInterrupt:
         pass
     finally:
