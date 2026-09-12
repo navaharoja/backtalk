@@ -380,6 +380,59 @@ def _fmt_tokens(n):
     return f"{n} tokens"
 
 
+# ---- Console side channel (the terminal window only; never spoken).
+# speak_reply feeds brain.ask_stream's on_event here so a tool-heavy turn
+# shows its work instead of a silent gap.
+def _short_tokens(n):
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _tool_console_line(name, tinp):
+    """One compact line for a tool call. This is the console, not the
+    spoken gate, so real paths and commands are fine and wanted."""
+    d = tinp or {}
+    try:
+        if name == "Bash":
+            cmd = " ".join(str(d.get("command", "")).split())
+            return f"$ {cmd[:100]}" if cmd else "$ (command)"
+        if name in ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit"):
+            p = str(d.get("file_path") or d.get("notebook_path") or "")
+            p = p.replace("\\", "/")
+            return f"{name} {p.rsplit('/', 1)[-1] or p}"
+        if name in ("Grep", "Glob"):
+            q = str(d.get("pattern") or d.get("query") or "")
+            return f"{name} {q[:80]}"
+        if name == "Task":
+            return f"Task: {str(d.get('description') or d.get('subagent_type') or '')[:80]}"
+        if name == "WebFetch":
+            return f"WebFetch {str(d.get('url', ''))[:80]}"
+        if name in ("TodoWrite",):
+            return name
+        extra = d.get("command") or d.get("path") or d.get("url") or ""
+        return f"{name} {str(extra)[:80]}".strip()
+    except Exception:
+        return name
+
+
+def _fmt_turn_stats(st):
+    st = st or {}
+    parts = []
+    ms = st.get("ms") or 0
+    if ms:
+        parts.append(f"{ms / 1000:.1f}s")
+    parts.append(f"{_short_tokens(st.get('out'))} out")
+    parts.append(f"{_short_tokens(st.get('in'))} in")
+    cost = st.get("cost") or 0.0
+    if cost >= 0.005:
+        parts.append(f"~${cost:.2f}")
+    return "  ·  ".join(parts)
+
+
 def _spoken_usage(sess, ctx_usage):
     """A short CFO brief of the session, written for the ear: plain
     numerals only (the TTS reads "40" fine; symbols come out garbled)."""
@@ -596,6 +649,23 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
 
+    last_kind = [None]
+
+    def on_event(ev: dict):
+        """Console-only trace of what the turn is doing (brain side
+        channel). Never spoken, never touches the reply or the bus."""
+        kind = ev.get("kind")
+        if kind == "thinking":
+            if last_kind[0] != "thinking":   # collapse a run of blocks
+                log("[think] thinking...")
+        elif kind == "tool":
+            log(f"[tool] {_tool_console_line(ev.get('name'), ev.get('input'))}")
+        elif kind == "result":
+            line = _fmt_turn_stats(ev.get("stats"))
+            if line:
+                log(f"[turn] {line}")
+        last_kind[0] = kind
+
     def emit(raw: str):
         nonlocal first, batch, pending
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
@@ -628,7 +698,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                 batch = []
 
     try:
-        async for sentence in brain.ask_stream(text):
+        async for sentence in brain.ask_stream(text, on_event=on_event):
             emit(sentence)
         if batch:
             mouth.say_chunk(" ".join(batch), pending)

@@ -24,10 +24,69 @@ only printed to a terminal window nobody saved. Every load-bearing line
 through log() so the next gremlin comes with receipts.
 """
 import datetime
+import os
+import re
 import sys
 from pathlib import Path
 
 LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "backtalk.log"
+
+# ---- Console color. Screen only; the log file never sees an escape code
+# (see log() — the receipts this module exists to produce must stay
+# greppable). Style is inferred from the "[tag]" prefix so not one of the
+# ~80 existing log() call sites has to change.
+_RESET = "\033[0m"
+_C = {
+    "you":    "\033[38;5;51m",    # bright cyan — the person
+    "reply":  "\033[38;5;231m",   # near-white — the agent's spoken words
+    "dim":    "\033[38;5;244m",   # grey — plumbing: ears, mouth, ptt, brain
+    "tool":   "\033[38;5;180m",   # tan — a tool call mid-turn
+    "think":  "\033[38;5;140m",   # muted violet — thinking / working
+    "turn":   "\033[38;5;108m",   # sage — the end-of-turn stat line
+    "perm":   "\033[38;5;214m",   # amber — a permission ask, must stand out
+    "error":  "\033[38;5;203m",   # red — anything that failed
+}
+# lowercase tags that are backtalk's own plumbing; anything else in the
+# "[x]" slot (i.e. the agent's name) is a spoken reply.
+_SYS_DIM = {"backtalk", "ears", "mouth", "ptt", "brain", "console", "sig"}
+_TAG_RE = re.compile(r"^\[([^\]]{1,20})\]")
+_ERR_RE = re.compile(r"error|failed|desync|can't|couldn't|BRAIN CONNECT"
+                     r"|no working|timed out", re.I)
+
+
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("BACKTALK_NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+_COLOR = False   # set by _init_console()
+
+
+def _style_for(line: str) -> str | None:
+    m = _TAG_RE.match(line)
+    if not m:
+        return None
+    tag = m.group(1).strip().lower()
+    if tag == "you":
+        return _C["you"]         # the person's words are never "an error"
+    if tag == "perm":
+        return _C["perm"]
+    if tag == "tool":
+        return _C["tool"]
+    if tag in ("think", "thinking"):
+        return _C["think"]
+    if tag == "turn":
+        return _C["turn"]
+    if tag in _SYS_DIM:
+        # a plumbing line that reports a failure gets the red, not grey
+        return _C["error"] if _ERR_RE.search(line) else _C["dim"]
+    return _C["reply"]      # the agent's name -> a spoken line
 
 
 def _init_console():
@@ -43,27 +102,42 @@ def _init_console():
     genuinely cannot draw degrades to "?" rather than raising mid
     sentence and taking the voice down. No-ops everywhere but Windows.
     """
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-        ctypes.windll.kernel32.SetConsoleCP(65001)
-    except Exception:
-        pass
+    global _COLOR
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetConsoleOutputCP(65001)
+            k32.SetConsoleCP(65001)
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x4) on stdout, so the
+            # ANSI color below actually renders in a classic console.
+            # Harmless if it fails; Windows Terminal / VS Code already
+            # honor the codes.
+            h = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if k32.GetConsoleMode(h, ctypes.byref(mode)):
+                k32.SetConsoleMode(h, mode.value | 0x0004)
+        except Exception:
+            pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    _COLOR = _color_enabled()
 
 
 _init_console()
 
 
 def log(line: str):
+    screen = line
+    if _COLOR:
+        style = _style_for(line)
+        if style:
+            screen = f"{style}{line}{_RESET}"
     try:
-        print(line, flush=True)
+        print(screen, flush=True)
     except UnicodeEncodeError:
         # Last resort if the console refused UTF-8: readable beats fatal.
         print(line.encode("ascii", "replace").decode("ascii"), flush=True)

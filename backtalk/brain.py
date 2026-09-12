@@ -113,6 +113,13 @@ class WarmBrain:
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,
+                # The SDK's default 1MB-per-line cap on CLI stdout kills
+                # the message reader outright when a single tool result
+                # (a big screenshot, a long crawl log) lands in one NDJSON
+                # line over that size. Raised, not removed: it's a safety
+                # ceiling, not a preallocated buffer, so this costs
+                # nothing until a message actually is this big.
+                max_buffer_size=10 * 1024 * 1024,
             )
         if resume:
             try:
@@ -161,6 +168,23 @@ class WarmBrain:
                 f.write(sid)
         except OSError:
             pass
+
+    @staticmethod
+    def _turn_stats(rm):
+        """Per-turn usage for the console line. Same source as _tally,
+        but the turn's own numbers rather than the running total. Never
+        raises — a missing/renamed field just drops that part."""
+        try:
+            u = getattr(rm, "usage", None) or {}
+            return {
+                "out": int(u.get("output_tokens") or 0),
+                "in": (int(u.get("input_tokens") or 0)
+                       + int(u.get("cache_read_input_tokens") or 0)),
+                "cost": float(getattr(rm, "total_cost_usd", 0.0) or 0.0),
+                "ms": int(getattr(rm, "duration_ms", 0) or 0),
+            }
+        except Exception:
+            return {}
 
     def _tally(self, rm, count_turn=True):
         """Session usage bookkeeping. Must never break a turn."""
@@ -318,8 +342,24 @@ class WarmBrain:
             await self._client.disconnect()
             self._client = None
 
-    async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
+    async def ask_stream(self, utterance: str, on_event=None):
+        """Yield complete sentences as they stream out of the model.
+
+        on_event, if given, is a plain (non-async) callback for a
+        SIDE CHANNEL: {"kind": "thinking"} when a reasoning block opens,
+        {"kind": "tool", "name": str, "input": dict} per tool call, and
+        {"kind": "result", "stats": {...}} at the end. It is display
+        only — it never affects what is yielded or when the pipe drains,
+        and it is wrapped so a bad callback can't take a turn down. Do
+        not move the drain/exit logic on its account."""
+        def _ev(d):
+            if on_event is None:
+                return
+            try:
+                on_event(d)
+            except Exception:
+                pass
+
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
@@ -327,7 +367,11 @@ class WarmBrain:
             t = type(msg).__name__
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
+                if ev.get("type") == "content_block_start":
+                    cb = ev.get("content_block", {}) or {}
+                    if cb.get("type") == "thinking":
+                        _ev({"kind": "thinking"})
+                elif ev.get("type") == "content_block_delta":
                     delta = ev.get("delta", {}) or {}
                     if delta.get("type") == "text_delta":
                         buf += delta.get("text", "")
@@ -351,9 +395,19 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "AssistantMessage":
+                # The full message that mirrors the deltas above — used
+                # ONLY to spot tool calls for the console side channel;
+                # its text is never yielded (the deltas already did).
+                for b in getattr(msg, "content", []) or []:
+                    if type(b).__name__ == "ToolUseBlock":
+                        _ev({"kind": "tool",
+                             "name": getattr(b, "name", "") or "tool",
+                             "input": getattr(b, "input", {}) or {}})
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
+                _ev({"kind": "result", "stats": self._turn_stats(msg)})
                 self._remember_session(msg)
                 await self._pull_rate_limits()
                 break
